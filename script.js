@@ -289,19 +289,20 @@ function toggleWatchList(video) {
 // Refresh bookmark button states on the visible trailer grid based on the
 // current (per-user) watchlist. Used when login state changes.
 function refreshBookmarkStates() {
-  const grid = document.getElementById("trailers-grid");
-  if (!grid) return;
+  const grids = document.querySelectorAll("#trailers-grid, #now-releasing-grid, #coming-2027-grid");
   const watchList = getWatchList();
-  grid.querySelectorAll(".trailer-card").forEach((card) => {
-    const vid = card.dataset.videoId;
-    const isBookmarked = Boolean(vid && watchList[vid]);
-    const btn = card.querySelector(".bookmark-button");
-    if (btn) {
-      btn.setAttribute("aria-pressed", String(isBookmarked));
-      btn.setAttribute("aria-label", isBookmarked ? "Remove from watch list" : "Add to watch list");
-      btn.setAttribute("title", isBookmarked ? "Remove from watch list" : "Add to watch list");
-      btn.innerHTML = getBookmarkIcon(isBookmarked);
-    }
+  grids.forEach((grid) => {
+    grid.querySelectorAll(".trailer-card").forEach((card) => {
+      const vid = card.dataset.videoId;
+      const isBookmarked = Boolean(vid && watchList[vid]);
+      const btn = card.querySelector(".bookmark-button");
+      if (btn) {
+        btn.setAttribute("aria-pressed", String(isBookmarked));
+        btn.setAttribute("aria-label", isBookmarked ? "Remove from watch list" : "Add to watch list");
+        btn.setAttribute("title", isBookmarked ? "Remove from watch list" : "Add to watch list");
+        btn.innerHTML = getBookmarkIcon(isBookmarked);
+      }
+    });
   });
 }
 
@@ -932,16 +933,653 @@ async function searchTVShowTrailers(query) {
   await loadTVShowTrailers(normalizedQuery);
 }
 
+// ===== TMDB RELEASE SECTIONS (Now Releasing / Coming in 2027) =====
+const TMDB_API_BASE = "https://api.themoviedb.org/3";
+const YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3";
+const RELEASE_SECTIONS_CACHE_KEY = "cinevault-release-sections-v1";
+const RELEASE_SECTIONS_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
+const RELEASE_MAX_SEARCH_FALLBACKS = 5; // max YouTube search.list calls per section
+const VALID_YOUTUBE_ID = /^[A-Za-z0-9_-]{11}$/;
+const YOUTUBE_THUMB_FALLBACK = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+// In-memory caches for TMDB responses (dedupes calls within a session)
+const tmdbCache = new Map();
+const tmdbVideoCache = new Map();
+
+function formatDateISO(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+// TMDB request helper: reuses credentials from config.js. Prefers the read
+// access token, falls back to the v3 API key query parameter.
+async function tmdbFetch(path, params = {}) {
+  const url = new URL(`${TMDB_API_BASE}${path}`);
+  const hasToken = typeof CONFIG !== "undefined" && CONFIG.TMDB_READ_ACCESS_TOKEN;
+  if (!hasToken) {
+    url.searchParams.set("api_key", (typeof CONFIG !== "undefined" && CONFIG.TMDB_API_KEY) || "");
+  }
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+
+  const cacheKey = url.toString();
+  const cached = tmdbCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) {
+    return cached.data;
+  }
+
+  const response = await fetch(cacheKey, { headers: hasToken ? { Authorization: `Bearer ${CONFIG.TMDB_READ_ACCESS_TOKEN}` } : {} });
+  if (!response.ok) {
+    throw new Error(`TMDB request failed with status ${response.status}`);
+  }
+  const data = await response.json();
+  tmdbCache.set(cacheKey, { data, expires: Date.now() + RELEASE_SECTIONS_CACHE_TTL });
+  return data;
+}
+
+// Keep only movies with a real release date inside the requested range
+function isValidReleaseMovie(movie, rangeStart, rangeEnd) {
+  if (!movie || !movie.id || !movie.title) return false;
+  const release = movie.release_date || "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(release)) return false;
+  if (rangeStart && release < rangeStart) return false;
+  if (rangeEnd && release > rangeEnd) return false;
+  return true;
+}
+
+// TMDB discover with pagination. A single page never holds every movie,
+// so we walk up to maxPages and de-duplicate by id.
+async function fetchMoviesByReleaseRange(rangeStart, rangeEnd, maxPages = 2, sortBy = "primary_release_date.desc") {
+  const movies = [];
+  const seen = new Set();
+  for (let page = 1; page <= maxPages; page++) {
+    let data;
+    try {
+      data = await tmdbFetch("/discover/movie", {
+        "primary_release_date.gte": rangeStart,
+        "primary_release_date.lte": rangeEnd,
+        sort_by: sortBy,
+        include_adult: "false",
+        include_video: "false",
+        page: String(page)
+      });
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    const results = Array.isArray(data.results) ? data.results : [];
+    results.forEach((movie) => {
+      if (seen.has(movie.id)) return;
+      if (!isValidReleaseMovie(movie, rangeStart, rangeEnd)) return;
+      seen.add(movie.id);
+      movies.push(movie);
+    });
+    if (page >= (data.total_pages || 1)) break;
+  }
+  return movies;
+}
+
+// Merge several release-date queries into one de-duplicated list
+async function fetchMergedReleaseMovies(queries) {
+  const settled = await Promise.allSettled(
+    queries.map((query) => fetchMoviesByReleaseRange(query.start, query.end, query.pages || 1, query.sortBy))
+  );
+  const merged = [];
+  const seen = new Set();
+  settled.forEach((result) => {
+    if (result.status !== "fulfilled") return;
+    result.value.forEach((movie) => {
+      if (seen.has(movie.id)) return;
+      seen.add(movie.id);
+      merged.push(movie);
+    });
+  });
+  // If every single query failed, surface the error so the section can show it
+  if (!merged.length && settled.every((result) => result.status === "rejected")) {
+    throw settled[0].reason || new Error("All TMDB release queries failed");
+  }
+  return merged;
+}
+
+// Movie videos straight from TMDB (no YouTube quota cost)
+async function fetchTmdbMovieVideos(movieId) {
+  const cached = tmdbVideoCache.get(movieId);
+  if (cached && cached.expires > Date.now()) return cached.videos;
+  try {
+    const data = await tmdbFetch(`/movie/${movieId}/videos`, {});
+    const videos = Array.isArray(data.results) ? data.results : [];
+    tmdbVideoCache.set(movieId, { videos, expires: Date.now() + RELEASE_SECTIONS_CACHE_TTL });
+    return videos;
+  } catch (error) {
+    return [];
+  }
+}
+
+// Rank TMDB video candidates; official trailers beat teasers and junk clips
+function rankTmdbVideos(videos) {
+  const junkPattern = /recap|review|reaction|explained|deleted scene|behind the scenes|bloopers|featurette|interview|soundtrack|lyrics?|karaoke/i;
+  return (videos || [])
+    .filter((video) => video && video.site === "YouTube" && VALID_YOUTUBE_ID.test(video.key || ""))
+    .filter((video) => (video.type === "Trailer" || video.type === "Teaser") && !junkPattern.test(video.name || ""))
+    .map((video) => {
+      let score = 0;
+      if (video.official) score += 50;
+      if (video.type === "Trailer") score += 20;
+      const name = (video.name || "").toLowerCase();
+      if (name.includes("official trailer")) score += 15;
+      else if (name.includes("trailer")) score += 8;
+      if (name.includes("teaser")) score += 3;
+      return { video, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.video);
+}
+
+// Batch-verify YouTube video ids via videos.list (1 quota unit per call).
+// Returns a Map of id -> { videoId, title, channel, description, thumbnail }.
+// On quota errors it sets the global quotaExhausted flag and returns empty.
+async function fetchYouTubeVideoDetails(videoIds) {
+  const uniqueIds = [...new Set(videoIds)].filter((id) => VALID_YOUTUBE_ID.test(id));
+  const empty = new Map();
+  if (!uniqueIds.length || quotaExhausted || typeof CONFIG === "undefined" || !CONFIG.youTube_App) return empty;
+
+  const cacheKey = `yt:video-details:${uniqueIds.slice().sort().join(",")}`;
+  if (apiCache.has(cacheKey)) return apiCache.get(cacheKey);
+
+  const params = new URLSearchParams({
+    part: "snippet",
+    id: uniqueIds.slice(0, 50).join(","),
+    key: CONFIG.youTube_App
+  });
+
+  try {
+    const response = await fetch(`${YOUTUBE_API_BASE}/videos?${params}`);
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const message = errorData?.error?.message || `YouTube request failed with status ${response.status}`;
+      if (message.toLowerCase().includes("quota")) {
+        quotaExhausted = true;
+        console.warn("YouTube API quota exhausted — video verification disabled until reload.");
+      }
+      throw new Error(message);
+    }
+    const data = await response.json();
+    const map = new Map();
+    (data.items || []).forEach((item) => {
+      const snippet = item.snippet || {};
+      map.set(item.id, {
+        videoId: item.id,
+        title: decodeHtmlEntities(snippet.title || ""),
+        channel: decodeHtmlEntities(snippet.channelTitle || ""),
+        description: decodeHtmlEntities(snippet.description || ""),
+        publishedAt: snippet.publishedAt || "",
+        thumbnail: snippet.thumbnails?.high?.url || snippet.thumbnails?.medium?.url || YOUTUBE_THUMB_FALLBACK(item.id)
+      });
+    });
+    apiCache.set(cacheKey, map);
+    return map;
+  } catch (error) {
+    console.warn("YouTube video verification failed:", error.message);
+    return empty;
+  }
+}
+
+function normalizeTitleText(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function getTitleTokens(title) {
+  const stopwords = new Set(["the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "movie", "film"]);
+  return normalizeTitleText(title).split(" ").filter((token) => token.length > 2 && !stopwords.has(token));
+}
+
+const NON_TRAILER_TITLE_PATTERN = /\b(review|reaction|explained|ending|recap|analysis|interview|behind the scenes|bloopers|deleted scene|fan made|fan edit|gameplay|soundtrack|lyrics?|music video|karaoke|premiere|theory)\b/i;
+const NON_TRAILER_DESC_PATTERN = /\b(review|reaction|explained|recap|gameplay|lyrics?|music video|karaoke|fan made|fan edit)\b/i;
+
+// A video only matches a movie when the title really is about that movie
+// and it is not an unrelated format (review, music video, etc.).
+function videoMatchesMovie(movie, videoTitle, videoDescription, videoChannel) {
+  if (NON_TRAILER_TITLE_PATTERN.test(videoTitle || "")) return false;
+  if (NON_TRAILER_DESC_PATTERN.test(videoDescription || "")) return false;
+
+  const tokens = getTitleTokens(movie.title);
+  if (!tokens.length) return false;
+  const normalized = normalizeTitleText(`${videoTitle} ${videoDescription} ${videoChannel}`);
+  const matched = tokens.filter((token) => normalized.includes(token));
+  if (matched.length / tokens.length < 0.6) return false;
+
+  // Year sanity check on the TITLE only: reject videos clearly tied to a
+  // different year (descriptions often contain copyright years, so they
+  // are not a reliable signal).
+  const releaseYear = (movie.release_date || "").slice(0, 4);
+  if (releaseYear) {
+    const yearsInTitle = (videoTitle || "").match(/\b(19|20)\d{2}\b/g) || [];
+    const acceptableYears = new Set([releaseYear, String(Number(releaseYear) + 1)]);
+    if (yearsInTitle.some((year) => !acceptableYears.has(year))) return false;
+  }
+  return true;
+}
+
+function scoreTrailerDetail(movie, detail) {
+  const title = (detail.title || "").toLowerCase();
+  const channel = (detail.channel || "").toLowerCase();
+
+  // A search result must actually present itself as a trailer/teaser —
+  // a channel-name match alone is never enough.
+  if (!/\b(trailer|teaser)\b/.test(title)) return -1;
+
+  let score = 20;
+  if (/official\s+trailer/.test(title)) score += 40;
+  if (/\btrailer\b/.test(title)) score += 20;
+  if (/\bteaser\b/.test(title)) score += 10;
+  const releaseYear = (movie.release_date || "").slice(0, 4);
+  if (releaseYear && title.includes(releaseYear)) score += 10;
+  if (/(sony|warner|universal|paramount|disney|20th|lionsgate|mgm|a24|netflix|wb|hbo|marvel|focus features|vertical|neon|miramax|columbia|tristar|united artists|dreamworks|illumination|skydance|new line)/.test(channel)) score += 20;
+  else if (/(movies?|pictures|film|entertainment|studio|releasing)/.test(channel)) score += 8;
+  if (/(reviews?|reaction|fan|breakdown|geek|topics|clips)/.test(channel)) score -= 25;
+  return score;
+}
+
+// Limited YouTube search.list fallback for movies TMDB had no usable video for.
+async function searchYouTubeTrailerForMovie(movie, stats) {
+  if (quotaExhausted || typeof CONFIG === "undefined" || !CONFIG.youTube_App) return null;
+
+  const cacheKey = `movie-trailer-search:${movie.id}`;
+  if (apiCache.has(cacheKey)) return apiCache.get(cacheKey);
+  if (inFlightRequests.has(cacheKey)) {
+    try {
+      return await inFlightRequests.get(cacheKey);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  stats.searches += 1;
+  const releaseYear = (movie.release_date || "").slice(0, 4);
+  const query = `${movie.title}${releaseYear ? " " + releaseYear : ""} official trailer`;
+  const params = new URLSearchParams({
+    part: "snippet",
+    q: query,
+    type: "video",
+    videoCategoryId: "1",
+    maxResults: "6",
+    key: CONFIG.youTube_App
+  });
+
+  const requestPromise = fetch(`${YOUTUBE_API_BASE}/search?${params}`).then(async (response) => {
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const message = errorData?.error?.message || `YouTube search failed with status ${response.status}`;
+      if (message.toLowerCase().includes("quota")) {
+        quotaExhausted = true;
+        console.warn("YouTube API quota exhausted — trailer search disabled until reload.");
+      }
+      throw new Error(message);
+    }
+    const data = await response.json();
+    return data.items || [];
+  });
+
+  inFlightRequests.set(cacheKey, requestPromise);
+
+  try {
+    const items = await requestPromise;
+    const detailMap = await fetchYouTubeVideoDetails(items.map((item) => item.id?.videoId).filter(Boolean));
+    const scored = [];
+
+    for (const item of items) {
+      const videoId = item.id?.videoId;
+      if (!videoId || !VALID_YOUTUBE_ID.test(videoId)) continue;
+      const detail = detailMap.get(videoId) || {
+        videoId,
+        title: decodeHtmlEntities(item.snippet?.title || ""),
+        channel: decodeHtmlEntities(item.snippet?.channelTitle || ""),
+        description: decodeHtmlEntities(item.snippet?.description || ""),
+        publishedAt: item.snippet?.publishedAt || "",
+        thumbnail: item.snippet?.thumbnails?.high?.url || YOUTUBE_THUMB_FALLBACK(videoId)
+      };
+      if (!videoMatchesMovie(movie, detail.title, detail.description, detail.channel)) continue;
+      const score = scoreTrailerDetail(movie, detail);
+      if (score > 0) scored.push({ detail, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored.length ? scored[0].detail : null;
+    apiCache.set(cacheKey, best);
+    return best;
+  } catch (error) {
+    console.warn(`Trailer search failed for "${movie.title}":`, error.message);
+    return null;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+}
+
+// Resolve the best playable trailer for a movie: TMDB videos first
+// (free), verified against YouTube, then a capped YouTube search fallback.
+async function resolveMovieTrailer(movie, stats) {
+  const tmdbVideos = await fetchTmdbMovieVideos(movie.id);
+  const candidates = rankTmdbVideos(tmdbVideos).slice(0, 3);
+
+  if (candidates.length) {
+    const detailMap = await fetchYouTubeVideoDetails(candidates.map((candidate) => candidate.key));
+    for (const candidate of candidates) {
+      const detail = detailMap.get(candidate.key);
+      if (detail && !videoMatchesMovie(movie, detail.title, detail.description, detail.channel)) {
+        continue;
+      }
+      return {
+        videoId: candidate.key,
+        title: detail ? detail.title : (candidate.name || movie.title),
+        channel: detail ? detail.channel : (candidate.official ? "Official" : "YouTube"),
+        description: detail ? detail.description : (movie.overview || ""),
+        publishedAt: detail ? detail.publishedAt : "",
+        thumbnail: detail ? detail.thumbnail : YOUTUBE_THUMB_FALLBACK(candidate.key),
+        source: "tmdb"
+      };
+    }
+  }
+
+  if (stats.searches < RELEASE_MAX_SEARCH_FALLBACKS) {
+    const found = await searchYouTubeTrailerForMovie(movie, stats);
+    if (found) return { ...found, source: "youtube-search" };
+  }
+
+  return null;
+}
+
+function sortNowReleasing(movies, todayISO) {
+  const upcoming = movies.filter((m) => m.release_date >= todayISO).sort((a, b) => a.release_date.localeCompare(b.release_date));
+  const past = movies.filter((m) => m.release_date < todayISO).sort((a, b) => b.release_date.localeCompare(a.release_date));
+  return [...upcoming, ...past];
+}
+
+// Run an async mapper with bounded concurrency (keeps latency low
+// without hammering the APIs).
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      results[current] = await fn(items[current], current);
+    }
+  }
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// Build one release section's data: movies filtered strictly by TMDB
+// release date, each paired with a verified trailer when one exists.
+// Trailer resolution runs in popularity order (more likely to have real
+// trailers); the final display lists are ordered by release date.
+async function buildReleaseSectionData(options) {
+  const { queries, trailerLimit, noTrailerLimit, sortFn, maxProcess } = options;
+
+  let movies;
+  try {
+    movies = await fetchMergedReleaseMovies(queries);
+  } catch (error) {
+    console.error("TMDB release fetch failed:", error);
+    return { error: true, withTrailers: [], withoutTrailers: [] };
+  }
+
+  if (!movies.length) {
+    return { error: false, withTrailers: [], withoutTrailers: [] };
+  }
+
+  const candidates = movies
+    .slice()
+    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+    .slice(0, maxProcess);
+
+  const stats = { searches: 0 };
+  const resolved = await mapWithConcurrency(candidates, 6, async (movie) => ({
+    movie,
+    trailer: await resolveMovieTrailer(movie, stats)
+  }));
+
+  const withTrailerEntries = resolved.filter((entry) => entry.trailer);
+  const withoutTrailerEntries = resolved.filter((entry) => !entry.trailer);
+
+  // Display order follows release date (upcoming first for Now Releasing,
+  // chronological for a full year)
+  const withTrailerMovies = sortFn(withTrailerEntries.map((entry) => entry.movie));
+  const orderIndex = new Map(withTrailerEntries.map((entry, index) => [entry.movie.id, index]));
+  const withTrailers = withTrailerMovies
+    .map((movie) => withTrailerEntries[orderIndex.get(movie.id)])
+    .filter(Boolean)
+    .slice(0, trailerLimit);
+
+  const withoutTrailers = withoutTrailerEntries
+    .map((entry) => ({ movie: entry.movie, trailer: null }))
+    .sort((a, b) => a.movie.release_date.localeCompare(b.movie.release_date))
+    .slice(0, noTrailerLimit);
+
+  return { error: false, withTrailers, withoutTrailers };
+}
+
+function readReleaseSectionsCache() {
+  try {
+    const raw = localStorage.getItem(RELEASE_SECTIONS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.expires || parsed.expires < Date.now()) return null;
+    return parsed.data || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeReleaseSectionsCache(data) {
+  try {
+    localStorage.setItem(RELEASE_SECTIONS_CACHE_KEY, JSON.stringify({ expires: Date.now() + RELEASE_SECTIONS_CACHE_TTL, data }));
+  } catch (_) { /* storage full or unavailable — cache is optional */ }
+}
+
+function wireReleaseCards(grid) {
+  grid.querySelectorAll(".trailer-card[data-video-id]").forEach((card) => {
+    const bookmarkButton = card.querySelector(".bookmark-button");
+    if (bookmarkButton) {
+      bookmarkButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const vid = card.dataset.videoId;
+        const details = trailersCache.get(vid) || {};
+        const isBookmarked = toggleWatchList({
+          id: { videoId: vid },
+          snippet: {
+            title: details.title || "Untitled trailer",
+            description: details.description || "",
+            channelTitle: details.channel || "",
+            publishedAt: details.publishedAt || "",
+            thumbnails: { high: { url: details.thumbnail || "" } }
+          }
+        });
+        bookmarkButton.setAttribute("aria-pressed", String(isBookmarked));
+        bookmarkButton.setAttribute("aria-label", isBookmarked ? "Remove from watch list" : "Add to watch list");
+        bookmarkButton.setAttribute("title", isBookmarked ? "Remove from watch list" : "Add to watch list");
+        bookmarkButton.innerHTML = getBookmarkIcon(isBookmarked);
+      });
+    }
+    card.addEventListener("click", openModalHandler);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openModalHandler(event);
+      }
+    });
+  });
+}
+
+function renderReleaseSection(entries, gridId, emptyMessage) {
+  const grid = document.getElementById(gridId);
+  if (!grid) return;
+
+  if (!entries.length) {
+    grid.innerHTML = `<p class="status-message">${escapeHtml(emptyMessage)}</p>`;
+    return;
+  }
+
+  const watchList = getWatchList();
+
+  grid.innerHTML = entries.map(({ movie, trailer }) => {
+    const releaseDate = movie.release_date || "TBA";
+    const hasTrailer = Boolean(trailer && trailer.videoId);
+    const thumbnail = hasTrailer ? trailer.thumbnail : getTmdbImageUrl(movie.poster_path);
+    const metaText = hasTrailer
+      ? `Releases ${releaseDate} · ${trailer.channel || "Official trailer"}`
+      : `Releases ${releaseDate} · No trailer yet`;
+
+    if (hasTrailer) {
+      trailersCache.set(trailer.videoId, {
+        title: trailer.title,
+        description: trailer.description || movie.overview || "No description available.",
+        channel: trailer.channel || "",
+        publishedAt: trailer.publishedAt || "",
+        thumbnail: trailer.thumbnail
+      });
+    }
+
+    const isBookmarked = hasTrailer && Boolean(watchList[trailer.videoId]);
+    const bookmarkHtml = hasTrailer
+      ? `<button class="bookmark-button" type="button" aria-label="${isBookmarked ? "Remove from watch list" : "Add to watch list"}" title="${isBookmarked ? "Remove from watch list" : "Add to watch list"}" aria-pressed="${isBookmarked}">${getBookmarkIcon(isBookmarked)}</button>
+         <span class="play-icon">▶</span>`
+      : "";
+
+    return `
+      <article class="trailer-card release-card${hasTrailer ? "" : " no-trailer"}" ${hasTrailer ? `data-video-id="${escapeHtml(trailer.videoId)}" role="button" tabindex="0"` : 'aria-disabled="true"'}>
+        <div class="trailer-thumb" style="background-image: url('${thumbnail}'); background-size: cover; background-position: center;">
+          ${bookmarkHtml}
+          <span class="duration-badge">${escapeHtml(releaseDate)}</span>
+        </div>
+        <h3 class="trailer-title">${escapeHtml(movie.title)}</h3>
+        <p class="trailer-meta">${escapeHtml(metaText)}</p>
+      </article>
+    `;
+  }).join("");
+
+  wireReleaseCards(grid);
+}
+
+function renderNoTrailerMovies(entries, gridId, wrapId) {
+  const wrap = document.getElementById(wrapId);
+  const grid = document.getElementById(gridId);
+  if (!wrap || !grid) return;
+
+  if (!entries.length) {
+    wrap.classList.add("page-hidden");
+    grid.innerHTML = "";
+    return;
+  }
+
+  wrap.classList.remove("page-hidden");
+  grid.innerHTML = entries.map(({ movie }) => `
+    <article class="release-poster-card">
+      <div class="release-poster" style="background-image: url('${getTmdbImageUrl(movie.poster_path)}');">
+        <span class="release-poster-badge">No trailer yet</span>
+      </div>
+      <h3 class="trailer-title">${escapeHtml(movie.title)}</h3>
+      <p class="trailer-meta">Releases ${escapeHtml(movie.release_date || "TBA")}</p>
+    </article>
+  `).join("");
+}
+
+function applyReleaseSectionsData(data) {
+  const releasingGrid = document.getElementById("now-releasing-grid");
+  const comingGrid = document.getElementById("coming-2027-grid");
+
+  if (data.nowReleasing.error) {
+    if (releasingGrid) releasingGrid.innerHTML = '<p class="status-message">Unable to load releases right now. Please try again later.</p>';
+  } else {
+    renderReleaseSection(data.nowReleasing.withTrailers, "now-releasing-grid", "No movies releasing in this window right now.");
+  }
+
+  if (data.coming2027.error) {
+    if (comingGrid) comingGrid.innerHTML = '<p class="status-message">Unable to load 2027 releases right now. Please try again later.</p>';
+    renderNoTrailerMovies([], "coming-2027-no-trailer-grid", "coming-2027-no-trailer-wrap");
+  } else {
+    renderReleaseSection(data.coming2027.withTrailers, "coming-2027-grid", "No 2027 movies with trailers found yet.");
+    renderNoTrailerMovies(data.coming2027.withoutTrailers, "coming-2027-no-trailer-grid", "coming-2027-no-trailer-wrap");
+  }
+}
+
+let releaseSectionsLoaded = false;
+
+async function loadReleaseSections() {
+  if (releaseSectionsLoaded) return;
+  releaseSectionsLoaded = true;
+
+  const cached = readReleaseSectionsCache();
+  if (cached) {
+    applyReleaseSectionsData(cached);
+    return;
+  }
+
+  const today = new Date();
+  const past = new Date(today);
+  past.setDate(past.getDate() - 30);
+  const future = new Date(today);
+  future.setDate(future.getDate() + 30);
+  const todayISO = formatDateISO(today);
+
+  const results = await Promise.allSettled([
+    buildReleaseSectionData({
+      // Two windows so we see both the newest releases and what is about
+      // to drop. Popularity sort surfaces notable films; release-date
+      // filtering still happens per movie.
+      queries: [
+        { start: todayISO, end: formatDateISO(future), sortBy: "popularity.desc", pages: 1 },
+        { start: formatDateISO(past), end: todayISO, sortBy: "popularity.desc", pages: 1 }
+      ],
+      trailerLimit: 8,
+      noTrailerLimit: 0,
+      sortFn: (movies) => sortNowReleasing(movies, todayISO),
+      maxProcess: 30
+    }),
+    buildReleaseSectionData({
+      // Sample each quarter of 2027 (popularity-sorted) so the section
+      // spans the whole year instead of only one TMDB page of January.
+      queries: [
+        { start: "2027-01-01", end: "2027-03-31", sortBy: "popularity.desc", pages: 1 },
+        { start: "2027-04-01", end: "2027-06-30", sortBy: "popularity.desc", pages: 1 },
+        { start: "2027-07-01", end: "2027-09-30", sortBy: "popularity.desc", pages: 1 },
+        { start: "2027-10-01", end: "2027-12-31", sortBy: "popularity.desc", pages: 1 }
+      ],
+      trailerLimit: 12,
+      noTrailerLimit: 8,
+      sortFn: (movies) => movies.slice().sort((a, b) => a.release_date.localeCompare(b.release_date)),
+      maxProcess: 40
+    })
+  ]);
+
+  const failed = { error: true, withTrailers: [], withoutTrailers: [] };
+  const data = {
+    nowReleasing: results[0].status === "fulfilled" ? results[0].value : failed,
+    coming2027: results[1].status === "fulfilled" ? results[1].value : failed
+  };
+
+  applyReleaseSectionsData(data);
+  if (!data.nowReleasing.error || !data.coming2027.error) {
+    writeReleaseSectionsCache(data);
+  }
+}
+
 function setPageView(view) {
   const isWatchlist = view === "watchlist";
   const heroBanner = document.getElementById("hero-banner");
   const categoriesSection = document.getElementById("categories-section");
-  const trailersSection = document.querySelector(".trailers-section:not(#watchlist-section)");
+  const trailersSection = document.querySelector(".trailers-section:not(#watchlist-section):not(#now-releasing-section):not(#coming-2027-section)");
   const watchlistSection = document.getElementById("watchlist-section");
+  const releaseSections = document.querySelectorAll("#now-releasing-section, #coming-2027-section");
 
   [heroBanner, categoriesSection, trailersSection].forEach((element) => {
     if (element) element.classList.toggle("page-hidden", isWatchlist);
   });
+  releaseSections.forEach((element) => element.classList.toggle("page-hidden", isWatchlist));
   if (watchlistSection) watchlistSection.classList.toggle("page-hidden", !isWatchlist);
   currentView = isWatchlist ? "watchlist" : view;
 }
@@ -1568,4 +2206,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // Karuwamo trailers mbere - ibi bizashiraho kandi hero banner
   console.log("Loading trailers for hero banner...");
   fetchTopMovieTrailers();
+
+  // Load TMDB release sections (Now Releasing / Coming in 2027) in parallel
+  loadReleaseSections().catch((error) => {
+    console.error("Failed to load release sections:", error);
+  });
 });

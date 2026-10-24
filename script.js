@@ -520,7 +520,6 @@ function renderTrailers(videos) {
         bookmarkButton.setAttribute("aria-pressed", String(isBookmarked));
         bookmarkButton.setAttribute("aria-label", isBookmarked ? "Remove from watch list" : "Add to watch list");
         bookmarkButton.setAttribute("title", isBookmarked ? "Remove from watch list" : "Add to watch list");
-        bookmarkButton.setAttribute("title", isBookmarked ? "Remove from watch list" : "Add to watch list");
         bookmarkButton.innerHTML = getBookmarkIcon(isBookmarked);
       });
     }

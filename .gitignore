@@ -1,2 +1,5 @@
 # Backup config duplicates
 config (1).js
+
+# API configuration (contains credentials)
+config.js

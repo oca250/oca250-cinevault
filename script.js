@@ -614,6 +614,34 @@ async function loadTrailers(query) {
   }
 }
 
+function isValidHttpUrl(url) {
+  try {
+    const u = new URL(url);
+    return (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname;
+  } catch (_) {
+    return false;
+  }
+}
+
+function getMovieSourcesFor(title, videoId) {
+  if (typeof CONFIG === "undefined" || !Array.isArray(CONFIG.MOVIE_SOURCES)) return [];
+  const t = (title || "").toLowerCase();
+  return CONFIG.MOVIE_SOURCES.filter((s) => {
+    if (!s || !s.url) return false;
+    if (!isValidHttpUrl(s.url)) return false;
+    if (s.videoId && videoId && s.videoId === videoId) return true;
+    if (s.titleMatch) {
+      const m = String(s.titleMatch).toLowerCase();
+      if (t.includes(m)) return true;
+    }
+    if (!s.titleMatch && !s.videoId) {
+      // If no match criteria specified, don't match by default to avoid accidental use
+      return false;
+    }
+    return false;
+  });
+}
+
 // Funguza indanga mu modal. Niba indanga ntiyoshobora guhumba, yerekana ifatazo ryo kuyibona kuri YouTube
 async function openTrailerModal(videoId, title) {
   const modal = document.getElementById("modal");
@@ -621,6 +649,9 @@ async function openTrailerModal(videoId, title) {
   const modalVideoContainer = document.querySelector(".modal-video-container");
   const modalPlayer = document.getElementById("modal-player");
   const modalDescription = document.querySelector(".modal-description");
+  const watchBtn = document.getElementById("modal-watch-full");
+  const downloadBtn = document.getElementById("modal-download");
+  const statusEl = document.getElementById("modal-source-status");
 
   if (!modal) return;
 
@@ -639,6 +670,93 @@ async function openTrailerModal(videoId, title) {
   }
 
   if (modalVideoContainer) modalVideoContainer.hidden = false;
+
+  // Setup full movie / download buttons
+  const sources = getMovieSourcesFor(details.title || title, videoId);
+  const watchSources = sources.filter((s) => (s.type || "watch") === "watch");
+  const downloadSources = sources.filter((s) => s.type === "download");
+
+  if (watchBtn) {
+    // Clone to remove old listeners
+    const newWatch = watchBtn.cloneNode(true);
+    watchBtn.parentNode.replaceChild(newWatch, watchBtn);
+    const w = document.getElementById("modal-watch-full");
+    if (w) {
+      w.onclick = null;
+      if (watchSources.length && watchSources[0].url) {
+        w.removeAttribute("disabled");
+        w.textContent = "Watch Full Movie";
+        w.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const url = watchSources[0].url;
+          if (!isValidHttpUrl(url)) {
+            if (statusEl) statusEl.textContent = "Full movie is not available yet.";
+            return;
+          }
+          if (statusEl) statusEl.textContent = "";
+          try {
+            window.open(url, "_blank", "noopener,noreferrer");
+          } catch (e) {
+            if (statusEl) statusEl.textContent = "Full movie is not available yet.";
+          }
+        };
+      } else {
+        w.setAttribute("disabled", "disabled");
+        w.textContent = "Watch Full Movie";
+        w.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (statusEl) statusEl.textContent = "Full movie is not available yet.";
+        };
+      }
+    }
+  }
+
+  if (downloadBtn) {
+    const newDl = downloadBtn.cloneNode(true);
+    downloadBtn.parentNode.replaceChild(newDl, downloadBtn);
+    const d = document.getElementById("modal-download");
+    if (d) {
+      d.onclick = null;
+      if (downloadSources.length && downloadSources[0].url) {
+        d.removeAttribute("disabled");
+        d.textContent = "Download Movie";
+        d.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const url = downloadSources[0].url;
+          if (!isValidHttpUrl(url)) {
+            if (statusEl) statusEl.textContent = "Download is not available for this movie.";
+            return;
+          }
+          if (statusEl) statusEl.textContent = "";
+          try {
+            const a = document.createElement("a");
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.download = "";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          } catch (e) {
+            if (statusEl) statusEl.textContent = "Download is not available for this movie.";
+          }
+        };
+      } else {
+        d.setAttribute("disabled", "disabled");
+        d.textContent = "Download Movie";
+        d.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (statusEl) statusEl.textContent = "Download is not available for this movie.";
+        };
+      }
+    }
+  }
+
+  if (statusEl) statusEl.textContent = "";
 
   modal.style.display = "flex";
 }

@@ -550,13 +550,22 @@ async function loadTrailers(query) {
   // Yerekana ko ibintu birimo gutegerezwa mbere yuko amakuru agaruka.
   grid.innerHTML = '<p class="status-message">Loading trailers...</p>';
 
+  // Check cache first unless forced refresh is intended by caller
+  if (apiCache.has(query)) {
+    const cached = apiCache.get(query);
+    if (Array.isArray(cached) && cached.length > 0) {
+      renderTrailers(cached);
+      return;
+    }
+  }
+
   const url = "https://www.googleapis.com/youtube/v3/search";
   const params = new URLSearchParams({
     part: "snippet",
     q: query,
     type: "video",
     videoCategoryId: "1",
-    order: "viewCount",
+    order: "relevance",
     maxResults: 12,
     key: CONFIG.youTube_App
   });
@@ -582,11 +591,26 @@ async function loadTrailers(query) {
       return;
     }
 
-    apiCache.set(query, items);
-    renderTrailers(items);
+    // Deduplicate by videoId
+    const seen = new Set();
+    const unique = [];
+    for (const item of items) {
+      const id = item.id?.videoId;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      unique.push(item);
+    }
+
+    apiCache.set(query, unique);
+    renderTrailers(unique);
   } catch (error) {
     console.error("Error loading trailers:", error);
-    grid.innerHTML = '<p class="status-message">Unable to load trailers right now. Please try again later.</p>';
+    const msg = error.message && error.message.toLowerCase().includes("quota")
+      ? "YouTube API quota has been reached. Please try again later."
+      : "Unable to load trailers right now. Please try again later.";
+    grid.innerHTML = `<p class="status-message">${escapeHtml(msg)}</p>`;
+  } finally {
+    inFlightRequests.delete(query);
   }
 }
 
@@ -672,9 +696,132 @@ function setupModalHandlers() {
   });
 }
 
+const LATEST_TRAILERS_CACHE_KEY = "cinevault-latest-trailers-v1";
+const LATEST_TRAILERS_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+function readLatestTrailersCache() {
+  try {
+    const raw = localStorage.getItem(LATEST_TRAILERS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.expires || parsed.expires < Date.now()) return null;
+    return parsed.data || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeLatestTrailersCache(data) {
+  try {
+    localStorage.setItem(LATEST_TRAILERS_CACHE_KEY, JSON.stringify({ expires: Date.now() + LATEST_TRAILERS_CACHE_TTL, data }));
+  } catch (_) { /* ignore */ }
+}
+
 // Iyi function itega trailers za film zisanzwe ziva ku YouTube.
-async function fetchTopMovieTrailers() {
-  await loadTrailers("official movie");
+async function fetchTopMovieTrailers(forceRefresh = false) {
+  const grid = document.getElementById("trailers-grid");
+  const sectionTitle = document.getElementById("trailers-section-title");
+  if (sectionTitle) sectionTitle.textContent = "Latest Trailers";
+
+  // Try TMDB first for fresher/latest movies with trailers
+  if (typeof CONFIG !== "undefined" && CONFIG.TMDB_READ_ACCESS_TOKEN || typeof CONFIG !== "undefined" && CONFIG.TMDB_API_KEY) {
+    if (!forceRefresh) {
+      const cached = readLatestTrailersCache();
+      if (cached && Array.isArray(cached.videos) && cached.videos.length) {
+        renderTrailers(cached.videos);
+        if (cached.hero) {
+          renderHeroBanner(cached.hero);
+          if (!heroRotationStarted && cached.videos.length > 1) {
+            rotateHeroMovieAutomatically();
+            heroRotationStarted = true;
+          }
+          allTrailers = cached.videos;
+        }
+        return;
+      }
+    } else {
+      // Clear caches to force refresh
+      try { localStorage.removeItem(LATEST_TRAILERS_CACHE_KEY); } catch (_) {}
+      apiCache.clear();
+      inFlightRequests.clear();
+    }
+
+    if (grid) grid.innerHTML = '<p class="status-message">Loading latest trailers...</p>';
+
+    try {
+      const today = new Date();
+      const past = new Date(today);
+      past.setDate(past.getDate() - 90);
+      const todayISO = formatDateISO(today);
+      const pastISO = formatDateISO(past);
+
+      const data = await tmdbFetch("/discover/movie", {
+        "primary_release_date.gte": pastISO,
+        "primary_release_date.lte": todayISO,
+        sort_by: "primary_release_date.desc",
+        include_adult: "false",
+        include_video: "false",
+        page: "1",
+        "vote_count.gte": "10"
+      });
+
+      let movies = Array.isArray(data.results) ? data.results : [];
+      movies = movies.filter((m) => m && m.id && m.title && /^\d{4}-\d{2}-\d{2}$/.test(m.release_date || ""));
+
+      if (movies.length === 0) {
+        // Fallback to popular recent
+        const data2 = await tmdbFetch("/movie/now_playing", { page: "1" });
+        movies = Array.isArray(data2.results) ? data2.results : [];
+      }
+
+      movies = movies.slice(0, 20);
+      const stats = { searches: 0 };
+      const resolved = await mapWithConcurrency(movies, 6, async (movie) => ({
+        movie,
+        trailer: await resolveMovieTrailer(movie, stats)
+      }));
+
+      const withTrailers = resolved.filter((r) => r.trailer);
+      if (withTrailers.length === 0) {
+        // Fallback to YouTube
+        await loadTrailers("official movie trailer");
+        return;
+      }
+
+      const videos = withTrailers.slice(0, 12).map((r) => {
+        const t = r.trailer;
+        const movie = r.movie;
+        return {
+          id: { videoId: t.videoId },
+          snippet: {
+            title: t.title || movie.title,
+            description: t.description || movie.overview || "",
+            channelTitle: t.channel || "",
+            publishedAt: t.publishedAt || movie.release_date || "",
+            thumbnails: {
+              high: { url: t.thumbnail || getTmdbImageUrl(movie.poster_path) },
+              medium: { url: t.thumbnail || getTmdbImageUrl(movie.poster_path) }
+            }
+          }
+        };
+      });
+
+      if (videos.length === 0) {
+        await loadTrailers("official movie trailer");
+        return;
+      }
+
+      writeLatestTrailersCache({ videos, hero: videos[0] });
+      renderTrailers(videos);
+      return;
+    } catch (error) {
+      console.error("TMDB latest trailers failed, falling back to YouTube:", error);
+      // Fall through to YouTube
+    }
+  }
+
+  // Fallback to YouTube search
+  await loadTrailers("official movie trailer");
 }
 
 // Iyi function ishanisha ijambo ryanditswe na serivisi ya trailers.
@@ -2205,6 +2352,18 @@ document.addEventListener("DOMContentLoaded", () => {
   // Karuwamo trailers mbere - ibi bizashiraho kandi hero banner
   console.log("Loading trailers for hero banner...");
   fetchTopMovieTrailers();
+
+  // Setup refresh button for Latest Trailers
+  const refreshBtn = document.getElementById("trailers-refresh-btn");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => {
+      if (currentView === 'tvshows') return;
+      refreshBtn.disabled = true;
+      fetchTopMovieTrailers(true).finally(() => {
+        refreshBtn.disabled = false;
+      });
+    });
+  }
 
   // Load TMDB release sections (Now Releasing / Coming in 2027) in parallel
   loadReleaseSections().catch((error) => {

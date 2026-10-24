@@ -1787,22 +1787,19 @@ async function loadReleaseSections() {
   const past = new Date(today);
   past.setDate(past.getDate() - 30);
   const future = new Date(today);
-  future.setDate(future.getDate() + 30);
+  future.setDate(future.getDate() + 60);
   const todayISO = formatDateISO(today);
 
   const results = await Promise.allSettled([
     buildReleaseSectionData({
-      // Two windows so we see both the newest releases and what is about
-      // to drop. Popularity sort surfaces notable films; release-date
-      // filtering still happens per movie.
+      // Use TMDB now_playing + discover for current/newly released movies
       queries: [
-        { start: todayISO, end: formatDateISO(future), sortBy: "popularity.desc", pages: 1 },
-        { start: formatDateISO(past), end: todayISO, sortBy: "popularity.desc", pages: 1 }
+        { start: formatDateISO(past), end: formatDateISO(future), sortBy: "primary_release_date.desc", pages: 2 }
       ],
-      trailerLimit: 8,
+      trailerLimit: 12,
       noTrailerLimit: 0,
       sortFn: (movies) => sortNowReleasing(movies, todayISO),
-      maxProcess: 30
+      maxProcess: 40
     }),
     buildReleaseSectionData({
       // Sample each quarter of 2027 (popularity-sorted) so the section
@@ -1821,8 +1818,32 @@ async function loadReleaseSections() {
   ]);
 
   const failed = { error: true, withTrailers: [], withoutTrailers: [] };
+  let nowReleasingData = results[0].status === "fulfilled" ? results[0].value : failed;
+
+  // Fallback to TMDB now_playing if discover returns empty
+  if (!nowReleasingData.error && (!nowReleasingData.withTrailers.length && !nowReleasingData.withoutTrailers.length)) {
+    try {
+      const np = await tmdbFetch("/movie/now_playing", { page: "1", region: "US" });
+      const movies = Array.isArray(np.results) ? np.results : [];
+      const filtered = movies.filter((m) => m && m.id && m.title && /^\d{4}-\d{2}-\d{2}$/.test(m.release_date || ""));
+      const candidates = filtered.slice(0, 30).sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+      const stats = { searches: 0 };
+      const resolved = await mapWithConcurrency(candidates, 6, async (movie) => ({
+        movie,
+        trailer: await resolveMovieTrailer(movie, stats)
+      }));
+      const withTrailerEntries = resolved.filter((entry) => entry.trailer);
+      const withTrailerMovies = sortNowReleasing(withTrailerEntries.map((entry) => entry.movie), todayISO);
+      const orderIndex = new Map(withTrailerEntries.map((entry, index) => [entry.movie.id, index]));
+      const withTrailers = withTrailerMovies.map((movie) => withTrailerEntries[orderIndex.get(movie.id)]).filter(Boolean).slice(0, 12);
+      nowReleasingData = { error: false, withTrailers, withoutTrailers: [] };
+    } catch (e) {
+      console.error("now_playing fallback failed:", e);
+    }
+  }
+
   const data = {
-    nowReleasing: results[0].status === "fulfilled" ? results[0].value : failed,
+    nowReleasing: nowReleasingData,
     coming2027: results[1].status === "fulfilled" ? results[1].value : failed
   };
 
